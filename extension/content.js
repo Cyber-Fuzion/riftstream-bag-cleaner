@@ -26,7 +26,13 @@
   const stopCheck = () => { if (stopFlag) throw new Error('Parado pelo usuário.'); };
 
   // ---------- helpers ----------
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Espera que continua funcionando com a aba oculta ou a janela minimizada: o Chrome freia setTimeout
+  // nesses casos, entao pedimos tambem ao service worker da extensao (que nao e freado) e vale o que responder primeiro.
+  const sleep = (ms) => new Promise((r) => {
+    let done = false; const fin = () => { if (!done) { done = true; r(); } };
+    setTimeout(fin, ms);
+    try { chrome.runtime.sendMessage({ rsbSleep: ms }, () => { void chrome.runtime.lastError; fin(); }); } catch (e) {}
+  });
   const norm = (s) => (s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase().trim();
   const tierIdx = (s) => TIERS.indexOf(norm(s));
   const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -36,8 +42,19 @@
     while (Date.now() - t0 < timeout) { const v = fn(); if (v) return v; await sleep(step); }
     return null;
   }
+  // memoria: no modo automatico, itens que ja foram lidos e nao precisam de nada nao sao clicados de novo.
+  // Vale so se o item e unico na mochila (mesma aparencia + mesmo nivel), a regra nao mudou e faz menos de 20 min.
+  // Modo manual sempre le tudo e atualiza a memoria. Para venda, so itens que NUNCA seriam vendidos sao pulados.
+  const memo = new Map(), keep = new Map();
+  let memoOn = false;
+  const cfgKey = () => JSON.stringify([cfg.act, cfg.sellLeft, cfg.eventAct]);
+  const MEMO_TTL = 20 * 60 * 1000;
   const bagItems = () => $$('.bag-grid .ibox').filter((b) => !b.closest('.forge-tab'));
   const sig = (el) => el.innerText.replace(/\s+/g, ' ').trim() + '|' + ((el.querySelector('img') || {}).src || '');
+  const ikey = (el) => el.className.replace(/\b(sel|on|active|focus|selected)\b/g, '').replace(/\s+/g, ' ').trim() + '|' + sig(el);
+  const keyCounts = () => { const m = new Map(); bagItems().forEach((e) => { const k = ikey(e); m.set(k, (m.get(k) || 0) + 1); }); return m; };
+  const remembered = (map, k, cnt, ck) => { const v = memoOn && map.get(k); return !!(v && v.ck === ck && Date.now() - v.t < MEMO_TTL && cnt.get(k) === 1); };
+  const remember = (map, i, ck) => { const el = bagItems()[i]; if (!el) return; if (map.size > 3000) map.clear(); map.set(ikey(el), { ck, t: Date.now() }); };
 
   // ---------- UI ----------
   const TIER_COLOR = ['#9aa0a6', '#52d68a', '#4da3ff', '#b66bff', '#ffa94d', '#ff5c5c', '#37e6d0', '#ff7ad9'];
@@ -301,7 +318,14 @@
       await sleep(220);
       const d = document.querySelector('aside.detail');
       const tag = d && d.querySelector('.rtag');
-      if (!tag) { await sleep(200); continue; }
+      if (!tag) {
+        // consumiveis (pergaminhos etc.) nao tem raridade nem favorito: o painel diz "Consumivel · xN" com o mesmo xN da caixinha
+        const lvT = String((it.querySelector('.lv') || {}).innerText || '').trim();
+        if (d && !d.querySelector('.fav-btn') && /CONSUMIVEL/.test(norm(d.innerText)) && lvT && d.innerText.includes(lvT)) {
+          return { i, sig: sig(it), tier: -1, slot: null, gems: 0, cosmetic: false, favBtn: null, fav: false, cons: true };
+        }
+        await sleep(200); continue;
+      }
       // o painel precisa mostrar o mesmo nivel que a caixinha do item clicada
       const lv = (it.querySelector('.lv') || {}).innerText;
       const dv = (d.innerText.match(/Nv\.\s*(\d+)/) || [])[1];
@@ -351,24 +375,32 @@
     await goBag();
     let on = 0, off = 0, fail = 0;
     const n = bagItems().length;
+    const ck = cfgKey(), cnt = keyCounts(), keys = bagItems().map(ikey);
+    let known = 0;
     for (let i = 0; i < n; i++) {
       stopCheck();
+      if (remembered(memo, keys[i], cnt, ck)) { known++; continue; }
       const info = await inspect(i);
       if (!info) { fail++; continue; }                       // não consegui ler: conta como falha e aborta antes de forjar/vender
-      if (info.tier < 0 || !info.favBtn) continue;
-      const act = effAct(info.tier);
-      const gear = GEAR.includes(info.slot);
-      if (info.cosmetic && cfg.eventAct !== 'tier') {
-        if (cfg.eventAct === 'skip' && act !== 'forge' && act !== 'sell') continue;   // em tier de forja/venda ele é protegido
-        if (!info.fav) { if (cfg.dry) on++; else if (await setFav(info, true)) on++; else fail++; }
-        continue;
+      const f0 = fail;
+      item: {
+        if (info.tier < 0 || !info.favBtn) break item;
+        const act = effAct(info.tier);
+        const gear = GEAR.includes(info.slot);
+        if (info.cosmetic && cfg.eventAct !== 'tier') {
+          if (cfg.eventAct === 'skip' && act !== 'forge' && act !== 'sell') break item;   // em tier de forja/venda ele é protegido
+          if (!info.fav) { if (cfg.dry) on++; else if (await setFav(info, true)) on++; else fail++; }
+          break item;
+        }
+        if (act === 'fav' && !info.fav && gear) {
+          if (cfg.dry) on++; else if (await setFav(info, true)) on++; else fail++;
+        } else if ((act === 'forge' || act === 'sell') && info.fav && gear && info.gems === 0) {
+          if (cfg.dry) off++; else if (await setFav(info, false)) off++; else fail++;
+        }
       }
-      if (act === 'fav' && !info.fav && gear) {
-        if (cfg.dry) on++; else if (await setFav(info, true)) on++; else fail++;
-      } else if ((act === 'forge' || act === 'sell') && info.fav && gear && info.gems === 0) {
-        if (cfg.dry) off++; else if (await setFav(info, false)) off++; else fail++;
-      }
+      if (fail === f0 && !cfg.dry) remember(memo, i, ck);
     }
+    if (known) log(`${known} itens já conhecidos, não precisei reler.`);
     log(`${cfg.dry ? '[sim] ' : ''}Favoritados: ${on} | Desfavoritados: ${off}${fail ? ' | falhas: ' + fail : ''}`);
     if (cfg.dry && off) log('[sim] Esses favoritos seriam removidos, então entrariam na forja/venda numa execução de verdade.');
     return { on, off, fail };
@@ -506,15 +538,24 @@
     const gt = info.tier === EVENT ? 3 : info.tier;            // Evento conta como Épico na forja
     return !prot.has(gt + ':' + info.slot);
   }
+  // true se o item PODERIA ser vendido em alguma rodada (ignora a protecao de grupos completos)
+  function couldSell(info) {
+    if (!info || (info.cosmetic && cfg.eventAct !== 'tier') || info.tier < 0 || info.fav || info.gems > 0 || !GEAR.includes(info.slot)) return false;
+    const a = effAct(info.tier);
+    return a === 'sell' || (a === 'forge' && !!cfg.sellLeft[info.tier]);
+  }
   async function sellLeftovers(prot) {
     await goBag();
     const n = bagItems().length;
     const sell = [];
+    const ck = cfgKey(), cnt = keyCounts(), keys = bagItems().map(ikey);
     for (let i = 0; i < n; i++) {
       stopCheck();
+      if (remembered(keep, keys[i], cnt, ck)) continue;       // item que nunca seria vendido (favorito, com gema, tier guardado...)
       const info = await inspect(i);
       if (!info) { log('Não consegui ler todos os itens, venda cancelada por segurança.'); return 0; }
       if (shouldSell(info, prot)) sell.push({ i, sig: info.sig });
+      else if (!couldSell(info)) remember(keep, i, ck);
     }
     if (!sell.length) { log('Nada para vender.'); return 0; }
     if (cfg.dry) { log(`[sim] Itens que seriam vendidos agora: ${sell.length} (estimativa mínima: não conta as sobras que surgiriam depois das forjas)`); return sell.length; }
@@ -554,6 +595,7 @@
 
   // ---------- orquestração ----------
   async function run(mode) {
+    memoOn = mode === 'auto';
     if (running) return;
     if (document.querySelector('.modal-body') || btn(/^VENDER SELECIONADOS/)) { log('Há uma janela ou o modo de venda aberto no jogo. Feche e tente de novo.'); return; }
     running = true; stopFlag = false; syncUI();
@@ -585,7 +627,7 @@
   }
 
   // ---------- auto ----------
-  setInterval(() => {
+  const autoTick = () => {
     if (!cfg.auto || cfg.dry || running) return;
     if (document.querySelector('.modal-body') || btn(/^VENDER SELECIONADOS/)) return;  // voce esta usando o jogo
     const c = bagCount();
@@ -593,7 +635,8 @@
     if (lastCount >= 0 && c.n < lastCount + 5) return;                              // só roda de novo quando entraram 5+ itens desde a última limpeza
     lastAuto = Date.now();
     run('auto');
-  }, 15000);
+  };
+  (async () => { for (;;) { await sleep(15000); try { autoTick(); } catch (e) {} } })();
 
   // ---------- init ----------
   try {
