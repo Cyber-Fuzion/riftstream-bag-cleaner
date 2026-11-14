@@ -12,7 +12,7 @@
   const GEAR = ['ARMA', 'ELMO', 'ARMADURA', 'ANEL'];
   // acoes por tier: fav = favoritar e guardar | forge = forjar | sell = vender | skip = ignorar
   const DEFAULTS = {
-    auto: false, dry: true, threshold: 45,
+    auto: false, dry: true, threshold: 45, refresh: true, refreshMin: 5, riskOk: false,   // refresh: recarrega a pagina sozinha quando voce esta fora
     act: ['forge', 'forge', 'forge', 'fav', 'fav', 'fav', 'fav', 'fav'],
     sellLeft: [true, true, true, false, false, false, false, false], // vender sobras de tiers em "forge"
     view: 'full', tab: 'rules', autoCollapse: true,   // view: full | compact | hidden
@@ -32,6 +32,13 @@
     let done = false; const fin = () => { if (!done) { done = true; r(); } };
     setTimeout(fin, ms);
     try { chrome.runtime.sendMessage({ rsbSleep: ms }, () => { void chrome.runtime.lastError; fin(); }); } catch (e) {}
+  });
+  // Impede que o Chrome "congele" a aba do jogo quando ela fica em segundo plano (uma trava aberta isenta a aba do congelamento).
+  try { if (navigator.locks) navigator.locks.request('rsb-keepalive', () => new Promise(() => {})); } catch (e) {}
+  // quanto tempo a aba ficou oculta durante a limpeza (para o log mostrar se o navegador deu uma freada)
+  let hiddenMs = 0, hiddenAt = document.hidden ? Date.now() : 0;
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) hiddenAt = Date.now(); else if (hiddenAt) { hiddenMs += Date.now() - hiddenAt; hiddenAt = 0; }
   });
   const norm = (s) => (s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase().trim();
   const tierIdx = (s) => TIERS.indexOf(norm(s));
@@ -154,11 +161,20 @@
           </div>
 
           <div class="rsb-card">
+            <h4>Forjas de alto risco</h4>
+            <p>Algumas forjas (como Lendário para Imortal) mostram um aviso final do jogo: se a roleta cair no vermelho, os itens e o ouro são perdidos. Por padrão a extensão pula essas forjas e avisa no log.</p>
+            <label class="row"><input type="checkbox" id="rsb-risk"> Confirmar sozinha o aviso final das forjas de alto risco</label>
+          </div>
+
+          <div class="rsb-card">
             <h4>Automático</h4>
             <p>Roda a limpeza sozinha quando a mochila enche. Só funciona com a simulação desligada.</p>
             <label class="row"><input type="checkbox" id="rsb-auto"> Ligar modo automático</label>
             <label class="row">Rodar quando a mochila tiver
               <input type="number" id="rsb-th" min="1" max="200" style="width:56px"> itens ou mais</label>
+            <label class="row"><input type="checkbox" id="rsb-rf"> Atualizar a página sozinha quando eu estiver fora do navegador</label>
+            <label class="row">Atualizar a cada
+              <input type="number" id="rsb-rfm" min="1" max="60" style="width:56px"> minutos</label>
           </div>
         </div>
 
@@ -193,6 +209,7 @@
           <ul>
             <li>Rode primeiro em <b>simulação</b>.</li>
             <li>Deixe a aba do personagem aberta e não clique no jogo enquanto ela roda.</li>
+            <li><b>Segundo plano:</b> o Chrome freia páginas que não estão visíveis. Se a limpeza para quando você usa outro programa, abra <code>chrome://flags</code>, procure <b>Calculate window occlusion on Windows</b>, deixe <b>Disabled</b> e reinicie o Chrome. Em <code>chrome://settings/performance</code>, adicione <code>riftstream.com.br</code> em "Manter sempre ativos". Janela minimizada continua sendo freada pelo Chrome, então deixe o Chrome aberto atrás dos outros programas.</li>
             <li>Itens com gema engastada nunca são forjados nem vendidos.</li>
           </ul>
         </div>
@@ -225,7 +242,7 @@
       return `Junta itens iguais e sobe para ${next}. ` +
         (cfg.sellLeft[i] ? 'O que sobrar é vendido.' : 'O que sobrar fica na mochila.');
     }
-    if (act === 'sell') return `Vende todo ${name} sem favorito e sem gema.`;
+    if (act === 'sell') return `Vende todo ${name} sem favorito e sem gema. Itens com visual especial (skins) seguem a opção "Itens com visual especial" em Opções.`;
     return 'A extensão não mexe nesse tier.';
   }
 
@@ -240,6 +257,9 @@
     $('#rsb-dry').checked = cfg.dry;
     $('#rsb-auto').checked = cfg.auto;
     $('#rsb-th').value = cfg.threshold;
+    $('#rsb-rf').checked = cfg.refresh;
+    $('#rsb-risk').checked = cfg.riskOk;
+    $('#rsb-rfm').value = cfg.refreshMin;
     $$('select[data-tier]', root).forEach((sel) => { sel.value = cfg.act[+sel.dataset.tier]; });
     $$('input[data-left]', root).forEach((c) => { c.checked = !!cfg.sellLeft[+c.dataset.left]; });
     $$('.rsb-tier', root).forEach((row) => {
@@ -275,6 +295,9 @@
       cfg.auto = t.checked;
       if (cfg.auto && cfg.dry) log('Aviso: o automático só age com a simulação desligada.');
     } else if (t.id === 'rsb-th') cfg.threshold = Math.max(1, +t.value || 45);
+    else if (t.id === 'rsb-rf') cfg.refresh = t.checked;
+    else if (t.id === 'rsb-risk') cfg.riskOk = t.checked;
+    else if (t.id === 'rsb-rfm') cfg.refreshMin = Math.min(60, Math.max(1, +t.value || 5));
     save(); syncUI();
   });
   root.addEventListener('click', (e) => {
@@ -378,7 +401,7 @@
   // forge/sell -> garante SEM favorito (favorito some da forja e da venda)
   async function syncFavorites() {
     await goBag();
-    let on = 0, off = 0, fail = 0;
+    let on = 0, off = 0, fail = 0, skins = 0;
     const n = bagItems().length;
     const ck = cfgKey(), cnt = keyCounts(), keys = bagItems().map(ikey);
     let known = 0;
@@ -393,6 +416,7 @@
         const act = effAct(info.tier);
         const gear = GEAR.includes(info.slot);
         if (info.cosmetic && cfg.eventAct !== 'tier') {
+          skins++;
           if (cfg.eventAct === 'skip' && act !== 'forge' && act !== 'sell') break item;   // em tier de forja/venda ele é protegido
           if (!info.fav) { if (cfg.dry) on++; else if (await setFav(info, true)) { on++; favNow = true; } else fail++; }
           break item;
@@ -405,6 +429,7 @@
       }
       if (fail === f0 && !cfg.dry) { remember(memo, i, ck); if (!couldSell({ ...info, fav: favNow })) remember(keep, i, ck); }
     }
+    if (skins) log(`${skins} itens com visual especial (skins) ${cfg.eventAct === 'skip' ? 'ignorados' : 'guardados'} e fora da venda. Para vender ou forjar como o tier, mude em Opções > Itens com visual especial.`);
     if (known) log(`${known} itens já conhecidos, não precisei reler.`);
     log(`${cfg.dry ? '[sim] ' : ''}Favoritados: ${on} | Desfavoritados: ${off}${fail ? ' | falhas: ' + fail : ''}`);
     if (cfg.dry && off) log('[sim] Esses favoritos seriam removidos, então entrariam na forja/venda numa execução de verdade.');
@@ -456,7 +481,7 @@
     for (let k = 0; k < 6; k++) {
       const m = document.querySelector('.modal-body'); if (!m) break;
       const scope = m.closest('.modal, [role=dialog]') || m.parentElement || document;
-      const b = $$('button', scope).find((x) => !x.disabled && /^(CONTINUAR|CANCELAR|FECHAR)/.test(norm(x.innerText)));
+      const b = $$('button', scope).find((x) => !x.disabled && /^(CONTINUAR|CANCELAR|FECHAR|VOLTAR)/.test(norm(x.innerText)));
       if (b) b.click(); else document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
       await sleep(500);
     }
@@ -464,6 +489,18 @@
   }
   const closeModal = () => closeAll();
 
+  // botao final da forja: "FORJAR", "FORJAR (ARRISCADO)" ou, nas forjas de maior risco, "ENTENDO O RISCO, FORJAR!" (aviso final do jogo)
+  const forgeBtn = () => btn(/^(FORJAR(\s|\(|$)|ENTENDO O RISCO)/);
+  // clique com a sequencia completa de eventos que um mouse gera (alguns botoes so reagem a pointerdown/up)
+  function fullClick(el) {
+    const r = el.getBoundingClientRect();
+    const o = { bubbles: true, cancelable: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, button: 0 };
+    const P = (n) => new PointerEvent(n, { ...o, pointerId: 1, isPrimary: true, pointerType: 'mouse' });
+    el.dispatchEvent(P('pointerdown')); el.dispatchEvent(new MouseEvent('mousedown', o));
+    el.dispatchEvent(P('pointerup')); el.dispatchEvent(new MouseEvent('mouseup', o));
+    el.dispatchEvent(new MouseEvent('click', o));
+  }
+  const isRiskGate = (b) => !!b && /^ENTENDO O RISCO/.test(norm(b.innerText));
   async function forgeAll() {
     if (!cfg.act.some((a, i) => a === 'forge' && i < ARCANO)) return 0;
     skipped.clear();
@@ -475,13 +512,18 @@
       if (!g) break;
       if (cfg.dry) break;
       g.first.click();
-      let ok = await waitFor(() => btn(/^FORJAR(\s|\(|$)/), 2500);
+      let ok = await waitFor(forgeBtn, 2500);
       if (!ok) {
         ['mousedown', 'mouseup', 'click'].forEach((t) => g.first.dispatchEvent(new MouseEvent(t, { bubbles: true })));
-        ok = await waitFor(() => btn(/^FORJAR(\s|\(|$)/), 2500);
+        ok = await waitFor(forgeBtn, 2500);
       }
       if (!ok) { log('Janela da forja não abriu, parando.'); await closeAll(); break; }
       if (ok.disabled) { log('Forja indisponível (ouro insuficiente?), parando.'); await closeAll(); break; }
+      if (isRiskGate(ok) && !cfg.riskOk) {
+        const chance = (norm(document.querySelector('.modal-body')?.innerText || '').match(/(\d+)% DE CHANCE/) || [])[1];
+        log(`Pulei ${TIER_LABEL[g.from]} ${g.slot}: forja de alto risco${chance ? ' (' + chance + '% de chance)' : ''} com aviso final do jogo. Em Opções você pode deixar a extensão confirmar esse aviso.`);
+        skipped.add(gkey(g)); await closeAll(); await sleep(300); continue;
+      }
       // pergaminho de sorte (so nos tiers onde voce escolheu usar)
       const sc = await applyScroll(cfg.scroll[g.from]);
       if (!sc.ok) {
@@ -490,14 +532,28 @@
       }
       if (cfg.scroll[g.from] !== 'none') log(`${TIER_LABEL[g.from]} ${g.slot}: ${sc.used ? 'pergaminho ' + (sc.used === 'big' ? 'Grande (+20%)' : 'de Sorte (+10%)') : 'sem pergaminho disponível, forjando sem'}.`);
       if (stopFlag) { await closeAll(); stopCheck(); }   // ultimo ponto seguro, antes de gastar o item
-      const fb = btn(/^FORJAR(\s|\(|$)/);
+      const fb = forgeBtn();
       if (!fb) { log('Botão FORJAR sumiu, parando.'); await closeAll(); break; }
+      const gate = isRiskGate(fb);
       fb.click();
+      if (gate) {
+        await sleep(1500);
+        // se o jogo ignorou o clique simples, tenta a sequencia completa de um clique de mouse (pointer, mouse e click)
+        if (forgeBtn()) { fullClick(fb); await sleep(1500); }
+        if (forgeBtn()) {
+          log('O jogo não aceitou o clique automático no aviso final. Clique você mesmo em "ENTENDO O RISCO, FORJAR!" (espero 90s, depois pulo essa forja).');
+          // avisa na aba: o titulo pisca ate voce clicar (ou acabar o tempo)
+          const t0t = document.title; let on = true;
+          const blink = setInterval(() => { document.title = on ? '⚠ CLIQUE NO AVISO DA FORJA' : t0t; on = !on; }, 800);
+          window.__rsbBlink = { blink, t0t };
+        }
+      }
       // Depois do clique: "FORJANDO..." (roleta nas forjas de risco), tela de resultado com CONTINUAR
       // e, se der certo, uma segunda tela revelando o item (tambem com CONTINUAR).
       let sawResult = false, failedNow = false, firstScreen = true;
       const t0 = Date.now();
-      while (Date.now() - t0 < 45000) {
+      while (Date.now() - t0 < (gate ? 90000 : 45000)) {
+        if (gate && !sawResult && stopFlag && forgeBtn()) break;   // parou enquanto esperava o seu clique
         const mb = document.querySelector('.modal-body');
         if (!mb) break;
         const cont = $$('button', mb).find((b) => !b.disabled && /^CONTINUAR/.test(norm(b.innerText)));
@@ -513,7 +569,12 @@
           await sleep(700);
         } else await sleep(300);
       }
-      if (!sawResult) { log('A forja não confirmou, parando.'); await closeAll(); break; }
+      if (window.__rsbBlink) { clearInterval(window.__rsbBlink.blink); document.title = window.__rsbBlink.t0t; window.__rsbBlink = null; }
+      if (!sawResult) {
+        if (stopFlag) { await closeAll(); stopCheck(); }
+        if (gate) { log(`Pulei ${TIER_LABEL[g.from]} ${g.slot}: o aviso final não foi confirmado.`); skipped.add(gkey(g)); await closeAll(); await sleep(300); continue; }
+        log('A forja não confirmou, parando.'); await closeAll(); break;
+      }
       if (document.querySelector('.modal-body')) { log('A janela da forja não fechou, parando.'); await closeAll(); break; }
       if (failedNow) failed++;
       done++;
@@ -602,7 +663,7 @@
   // ---------- orquestração ----------
   async function run(mode) {
     memoOn = mode === 'auto';
-    runStart = Date.now();
+    runStart = Date.now(); hiddenMs = 0; if (document.hidden) hiddenAt = runStart;
     if (running) return;
     if (document.querySelector('.modal-body') || btn(/^VENDER SELECIONADOS/)) { log('Há uma janela ou o modo de venda aberto no jogo. Feche e tente de novo.'); return; }
     running = true; stopFlag = false; syncUI();
@@ -627,6 +688,8 @@
       log(stopFlag ? 'Parado pelo usuário.' : 'Erro: ' + err.message);
       if (stopFlag && mode === 'auto') { cfg.auto = false; save(); log('Modo automático desligado porque você parou a execução.'); }
     } finally {
+      if (document.hidden && hiddenAt) { hiddenMs += Date.now() - hiddenAt; hiddenAt = Date.now(); }
+      if (hiddenMs > 3000) log(`A aba ficou oculta por ${Math.round(hiddenMs / 1000)}s durante a limpeza. Se travou aí, veja a dica de segundo plano na aba Ajuda.`);
       lastAuto = Date.now(); const bc = bagCount(); if (bc) lastCount = bc.n;
       try { await closeAll(); } catch (e) {}   // sempre deixa a tela do jogo limpa
       running = false; stopFlag = false; syncUI();
@@ -635,6 +698,11 @@
 
   // ---------- auto ----------
   const autoTick = () => {
+    // fora do navegador a pagina fica parada ou com dados velhos: recarrega de tempos em tempos (so sem nada aberto e sem rodada em andamento)
+    if (cfg.auto && !cfg.dry && cfg.refresh && !running && (document.hidden || !document.hasFocus())
+        && performance.now() > cfg.refreshMin * 60000 && !document.querySelector('.modal-body') && !btn(/^VENDER SELECIONADOS/)) {
+      location.reload(); return;
+    }
     if (!cfg.auto || cfg.dry || running) return;
     if (document.querySelector('.modal-body') || btn(/^VENDER SELECIONADOS/)) return;  // voce esta usando o jogo
     const c = bagCount();
@@ -658,6 +726,7 @@
         if (!['full', 'compact', 'hidden'].includes(cfg.view)) cfg.view = 'full';
         if (!['rules', 'opts', 'help'].includes(cfg.tab)) cfg.tab = 'rules';
         cfg.threshold = Math.max(1, +cfg.threshold || 45);
+        cfg.refreshMin = Math.min(60, Math.max(1, +cfg.refreshMin || 5)); cfg.refresh = cfg.refresh !== false; cfg.riskOk = cfg.riskOk === true;
         if (cfg.act[ARCANO] === 'forge') cfg.act[ARCANO] = 'fav';
       }
       syncUI();

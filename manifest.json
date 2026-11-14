@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "RiftStream Bag Cleaner",
-  "version": "1.9.6",
+  "version": "1.9.13",
   "description": "Organiza a mochila do RiftStream com as suas regras por raridade: favoritar, forjar e vender itens.",
   "permissions": [
     "storage"
